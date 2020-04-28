@@ -287,6 +287,20 @@ static vec3f eval_normalmap(
     const ptr::object* object, int element, const vec2f& uv) {
   // YOUR CODE GOES HERE ------------------------------------------
   return eval_normal(object, element, uv);
+
+  auto [tu, tv] = eval_element_tangents(object, element);
+  vec3f normal = eval_normal(object, element, uv);
+  auto tangent_frame = {tu, tv, normal};
+
+  // return normal;
+
+  // auto displacement = eval_texturef(object->material->color_tex, uv);
+
+  auto texture = eval_texture(object->shape->subdiv_displacement_tex, uv);
+  auto true_normal = 2*texture - 1;
+  return {tu.x * true_normal.x + tu.y * true_normal.y + tu.z * true_normal.z,
+          tv.x * true_normal.x + tv.y * true_normal.y + tv.z * true_normal.z,
+          normal.x * true_normal.x + normal.y * true_normal.y + normal.z * true_normal.z};
 }
 
 // Eval shading normal
@@ -1128,17 +1142,25 @@ static float sample_lights_pdf(
 static vec3f eval_scattering(
     const ptr::vsdf& vsdf, const vec3f& outgoing, const vec3f& incoming) {
   // YOUR CODE GOES HERE ------------------------------------------
+  if (vsdf.density == zero3f) return zero3f;
+  return vsdf.density * vsdf.scatter * 
+          eval_phasefunction(vsdf.anisotropy, outgoing, incoming);
 }
 
 static vec3f sample_scattering(
     const ptr::vsdf& vsdf, const vec3f& outgoing, float rnl, const vec2f& rn) {
   // YOUR CODE GOES HERE ------------------------------------------
+  if (vsdf.density == zero3f) return zero3f;
+  return sample_phasefunction(vsdf.anisotropy, outgoing, rn);
 }
 
 static float sample_scattering_pdf(
     const ptr::vsdf& vsdf, const vec3f& outgoing, const vec3f& incoming) {
   // YOUR CODE GOES HERE ------------------------------------------
+  if (vsdf.density == zero3f) return 0;
+  return sample_phasefunction_pdf(vsdf.anisotropy, outgoing, incoming);
 }
+
 
 // Path tracing.
 static vec4f trace_path(const ptr::scene* scene, const ray3f& ray_,
@@ -1147,6 +1169,7 @@ static vec4f trace_path(const ptr::scene* scene, const ray3f& ray_,
   // initialize
   auto radiance = zero3f;
   auto weight   = vec3f{1, 1, 1};
+  auto volume_stack  = std::vector<vsdf>{};
   auto ray      = ray_;
   auto hit      = false;
 
@@ -1159,48 +1182,92 @@ static vec4f trace_path(const ptr::scene* scene, const ray3f& ray_,
       break;
     }
 
-    // prepare shading point
-    auto outgoing = -ray.d;
-    auto object   = scene->objects[intersection.object];
-    auto element  = intersection.element;
-    auto uv       = intersection.uv;
-    auto position = eval_position(object, element, uv);
-    auto normal   = eval_shading_normal(object, element, uv, outgoing);
-    auto emission = eval_emission(object, element, uv, normal, outgoing);
-    auto brdf     = eval_brdf(object, element, uv, normal, outgoing);
-
-    // handle opacity
-    if (brdf.opacity < 1 && rand1f(rng) >= brdf.opacity) {
-      ray = {position + ray.d * 1e-2f, ray.d};
-      bounce -= 1;
-      continue;
+    // <sample transmittance>
+    auto in_volume = false;
+    if (!volume_stack.empty()) {
+      auto extinction = volume_stack.back().density;
+      auto distance = sample_transmittance(extinction, intersection.distance, 
+                                            rand1f(rng), rand1f(rng));
+      weight *= eval_transmittance(extinction, distance) /
+                sample_transmittance_pdf(extinction, distance, intersection.distance);
+      in_volume             = distance < intersection.distance;
+      intersection.distance = distance;
     }
-    hit = true;
 
-    // accumulate emission
-    radiance += weight * eval_emission(emission, normal, outgoing);
+    if (!in_volume) {
+      // <handle surface>
+      // prepare shading point
+      auto outgoing = -ray.d;
+      auto object   = scene->objects[intersection.object];
+      auto element  = intersection.element;
+      auto uv       = intersection.uv;
 
-    // next direction
-    auto incoming = zero3f;
-    if (!is_delta(brdf)) {
-      if (rand1f(rng) < 0.5f) {
-        incoming = sample_brdfcos(
-            brdf, normal, outgoing, rand1f(rng), rand2f(rng));
-      } else {
-        incoming = sample_lights(
-            scene, position, rand1f(rng), rand1f(rng), rand2f(rng));
+      auto position = eval_position(object, element, uv);
+      auto normal   = eval_shading_normal(object, element, uv, outgoing);
+      auto emission = eval_emission(object, element, uv, normal, outgoing);
+      auto brdf     = eval_brdf(object, element, uv, normal, outgoing);
+
+      // handle opacity
+      if (brdf.opacity < 1 && rand1f(rng) >= brdf.opacity) {
+        ray = {position + ray.d * 1e-2f, ray.d};
+        bounce -= 1;
+        continue;
       }
-      weight *= eval_brdfcos(brdf, normal, outgoing, incoming) /
-                (0.5f * sample_brdfcos_pdf(brdf, normal, outgoing, incoming) +
-                    0.5f * sample_lights_pdf(scene, position, incoming));
+      hit = true;
+
+      // accumulate emission
+      radiance += weight * eval_emission(emission, normal, outgoing);
+
+      // next direction
+      auto incoming = zero3f;
+      if (!is_delta(brdf)) {
+        if (rand1f(rng) < 0.5f) {
+          incoming = sample_brdfcos(
+              brdf, normal, outgoing, rand1f(rng), rand2f(rng));
+        } else {
+          incoming = sample_lights(
+              scene, position, rand1f(rng), rand1f(rng), rand2f(rng));
+        }
+        weight *= eval_brdfcos(brdf, normal, outgoing, incoming) /
+                  (0.5f * sample_brdfcos_pdf(brdf, normal, outgoing, incoming) +
+                      0.5f * sample_lights_pdf(scene, position, incoming));
+      } else {
+        incoming = sample_delta(brdf, normal, outgoing, rand1f(rng));
+        weight *= eval_delta(brdf, normal, outgoing, incoming) /
+                  sample_delta_pdf(brdf, normal, outgoing, incoming);
+      }
+
+      if (has_volume(object) && dot(normal, outgoing)*dot(normal, incoming) < 0) {
+        if (volume_stack.empty()) {
+          volume_stack.push_back(eval_vsdf(object, element, uv));
+        } else {
+          volume_stack.pop_back();
+        }
+      }
+
+      // setup next iteration
+      ray = {position, incoming};
     } else {
-      incoming = sample_delta(brdf, normal, outgoing, rand1f(rng));
-      weight *= eval_delta(brdf, normal, outgoing, incoming) /
-                sample_delta_pdf(brdf, normal, outgoing, incoming);
+      // <handle volume>
+      auto position   = ray.o + ray.d * intersection.distance; // eval pos
+      auto vol        = volume_stack.back(); // get volume props
+      auto outgoing  = -ray.d; // outgoing
+
+      auto emission = vol.density * (1 - vol.scatter) * vol.anisotropy;
+      radiance += weight * emission; // emission
+
+      auto i = rand1f(rng) < 0.5 ? // incoming
+                sample_scattering(vol, outgoing, rand1f(rng), rand2f(rng)) :
+                sample_lights(scene, position, rand1f(rng), rand1f(rng), rand2f(rng));
+
+      weight *= eval_scattering(vol, outgoing, i) * 2 /
+                (sample_scattering_pdf(vol, outgoing, i) + sample_lights_pdf(scene, position, i));
+      
+      // setup next iteration
+      ray = {position, i};
     }
 
-    // setup next iteration
-    ray = {position, incoming};
+    
 
     // check weight
     if (weight == zero3f || !isfinite(weight)) break;
@@ -1448,8 +1515,138 @@ void init_lights(ptr::scene* scene, const trace_params& params,
 // perform one level of subdivision and modify
 template <typename T>
 static void subdivide_catmullclark(
-    std::vector<vec4i>& quads, std::vector<T>& vert, bool lock_boundary) {
+    std::vector<vec4i>& quads, std::vector<T>& verts, bool lock_boundary) {
   // YOUR CODE GOES HERE ------------------------------------------
+
+  // <initialize edges>
+  // construct edge map and get edges and boundary
+  auto emap = make_edge_map(quads);
+  auto edges = get_edges(emap);
+  auto boundary = get_boundary(emap);
+
+  // initialize number of elements
+  auto nverts    = (int)verts.size();      //number of vertices
+  auto nedges    = (int)edges.size();      //number of edges
+  auto nboundary = (int)boundary.size();   //number of boundary
+  auto nfaces    = (int)quads.size();      //number of faces
+
+
+  // <create vertices> // phase 1
+  auto tverts = std::vector<T>();      //tesselated vertex
+  for (auto v : verts) // vertices [0, nverts)
+    tverts.push_back(v);
+  for (auto e : edges) // edge vertices [nverts, nverts+nedges)
+    tverts.push_back((verts[e.x] + verts[e.y]) / 2);
+  for (auto q : quads) // face vertices [nverts+nedges, nverts+nedges+nf)
+    if (q.z != q.w) // quads
+      tverts.push_back((verts[q.x] + verts[q.y] +
+                        verts[q.z] + verts[q.w]) / 4);
+    else // triangles
+      tverts.push_back((verts[q.x] + verts[q.y] +
+                        verts[q.z]) / 3);
+  
+  // <create faces>
+  auto tquads = std::vector<vec4i>();
+  // for (auto [i, q] : yocto::common::enumerate<vec4i>(quads)) {
+  for (auto i = 0; i < nfaces; i++) {
+    auto q = quads[i];
+    if(q.z != q.w) {
+      tquads.push_back({q.x, nverts + edge_index(emap, {q.x,q.y}),
+                        nverts + nedges + i, 
+                        nverts + edge_index(emap, {q.w, q.x}) });
+      tquads.push_back({q.y, nverts + edge_index(emap, {q.y,q.z}),
+                        nverts + nedges + i, 
+                        nverts + edge_index(emap, {q.x, q.y} )});
+      tquads.push_back({q.z, nverts + edge_index(emap, {q.z, q.w}),
+                        nverts + nedges + i,
+                        nverts + edge_index(emap, {q.y, q.z}) });
+      tquads.push_back({q.w, nverts + edge_index(emap, {q.w, q.x}),
+                        nverts + nedges + i,
+                        nverts + edge_index(emap, {q.z, q.w}) });
+    } else {
+      tquads.push_back({q.x, nverts + edge_index(emap, {q.x, q.y}),
+                        nverts + nedges + i, 
+                        nverts + edge_index(emap, {q.z, q.x}) });
+      tquads.push_back({q.y, nverts + edge_index(emap, {q.y, q.z}),
+                        nverts + nedges + i, 
+                        nverts + edge_index(emap, {q.x, q.y}) });
+      tquads.push_back({q.z, nverts + edge_index(emap, {q.z, q.x}),
+                        nverts + nedges + i, 
+                        nverts + edge_index(emap, {q.y, q.z}) });
+    }
+  }
+
+  // <setup boundary>
+  auto tboundary = std::vector<vec2i>();
+  for (auto e : boundary) {
+    tboundary.push_back({e.x, nverts + edge_index(emap,e) });
+    tboundary.push_back({nverts + edge_index(emap, e), e.y});
+  }
+
+  // <setup creases>
+  auto tcrease_edges = std::vector<vec2i>();
+  auto tcrease_verts = std::vector<int>();
+  if (lock_boundary) {
+    for (auto& b : tboundary) {
+      tcrease_verts.push_back(b.x);
+      tcrease_verts.push_back(b.y);
+    }
+  } else {
+    for (auto& b : tboundary) 
+      tcrease_edges.push_back(b);
+  }
+
+  // <define vertex valence>
+  auto tvert_val = std::vector<int>(tverts.size(), 2);
+  for (auto& e : tboundary) {
+    tvert_val[e.x] = (lock_boundary) ? 0 : 1;
+    tvert_val[e.y] = (lock_boundary) ? 0 : 1;
+  }
+
+  // <averaging> // phase 2
+  auto avert = std::vector<T>(tverts.size(), T());
+  auto acount = std::vector<int>(tverts.size(), 0);
+  for (auto p : tcrease_verts) {
+    if (tvert_val[p] != 0) 
+      continue;
+    avert[p]  += tverts[p]; 
+    acount[p] += 1;
+  }
+  for (auto& e : tcrease_edges) {
+    auto c = (tverts[e.x] + tverts[e.y]) / 2;
+    for (auto vid : {e.x, e.y}) {
+      if (tvert_val[vid] != 1) 
+        continue;
+      avert[vid]  += c; 
+      acount[vid] += 1;
+    }
+  }
+  for (auto& q : tquads) {
+    auto c = (tverts[q.x] + tverts[q.y] +
+              tverts[q.z] + tverts[q.w]) / 4;
+    for (auto vid : {q.x, q.y, q.z, q.w}) {
+      if (tvert_val[vid] != 2) 
+        continue;
+      avert[vid]  += c; 
+      acount[vid] += 1;
+    }
+  }
+  for (auto i = 0; i < tverts.size(); i++)
+    avert[i] /= (float)acount[i];
+
+  // <correction> // phase 3
+  // p = p + (avg_p - p) * (4/avg_count)
+  for (auto i = 0; i < tverts.size(); i++) {
+    if (tvert_val[i] != 2) 
+      continue;
+    avert[i] = tverts[i] +
+                (avert[i] - tverts[i]) * (4 / (float)acount[i]);
+  }
+  tverts = avert;
+
+  // done
+  swap(tquads, quads);
+  swap(tverts, verts);
 }
 
 // get the number of subdivs
@@ -1473,7 +1670,7 @@ static void subdivide_shape(ptr::shape* shape) {
     auto quadstexcoord = shape->subdiv_quadstexcoord;
     auto fvtexcoords   = shape->subdiv_texcoords;
     for (auto idx = 0; idx < shape->subdiv_level; idx++) {
-      subdivide_catmullclark(quadstexcoord, fvtexcoords, false);
+      subdivide_catmullclark(quadstexcoord, fvtexcoords, true);
     }
     auto fvnormals = compute_normals(quadspos, fvpositions);
     auto [quads, positions, normals, texcoords] = split_facevarying(
@@ -1493,6 +1690,7 @@ static void subdivide_shape(ptr::shape* shape) {
       shape->positions[idx] += shape->normals[idx] *
                                shape->subdiv_displacement * displacement;
     }
+    shape->normals = compute_normals(shape->triangles, shape->positions);
   }
 }
 

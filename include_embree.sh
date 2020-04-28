@@ -1,0 +1,2 @@
+LD_LIBRARY_PATH=/usr/lib64/
+export LD_LIBRARY_PATH
