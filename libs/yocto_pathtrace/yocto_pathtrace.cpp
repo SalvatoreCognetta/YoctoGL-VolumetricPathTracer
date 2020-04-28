@@ -1249,22 +1249,33 @@ static vec4f trace_path(const ptr::scene* scene, const ray3f& ray_,
       ray = {position, incoming};
     } else {
       // <handle volume>
-      auto position   = ray.o + ray.d * intersection.distance; // eval pos
-      auto vol        = volume_stack.back(); // get volume props
-      auto outgoing  = -ray.d; // outgoing
+      auto outgoing = -ray.d; // outgoing
+      auto object   = scene->objects[intersection.object];
+      auto element  = intersection.element;
+      auto uv       = intersection.uv;
 
-      auto emission = vol.density * (1 - vol.scatter) * vol.anisotropy;
+      auto position   = ray.o + ray.d * intersection.distance; // eval pos
+      auto normal     = eval_shading_normal(object, element, uv, outgoing);
+      auto emission   = eval_emission(object, element, uv, normal, outgoing);
+      auto vol        = volume_stack.back(); // get volume props
+
+      // handle opacity
+      hit = true;
+      
+      // accumulate emission
+      emission =  vol.density * (1 - vol.scatter) * emission;
       radiance += weight * emission; // emission
 
-      auto i = rand1f(rng) < 0.5 ? // incoming
+      // next direction
+      auto incoming = rand1f(rng) < 0.5 ? // incoming
                 sample_scattering(vol, outgoing, rand1f(rng), rand2f(rng)) :
                 sample_lights(scene, position, rand1f(rng), rand1f(rng), rand2f(rng));
 
-      weight *= eval_scattering(vol, outgoing, i) * 2 /
-                (sample_scattering_pdf(vol, outgoing, i) + sample_lights_pdf(scene, position, i));
+      weight *= eval_scattering(vol, outgoing, incoming) * 2 /
+                (sample_scattering_pdf(vol, outgoing, incoming) + sample_lights_pdf(scene, position, incoming));
       
       // setup next iteration
-      ray = {position, i};
+      ray = {position, incoming};
     }
 
     
