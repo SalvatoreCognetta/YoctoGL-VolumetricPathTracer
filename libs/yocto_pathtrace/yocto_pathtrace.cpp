@@ -286,7 +286,7 @@ static std::pair<vec3f, vec3f> eval_element_tangents(
 static vec3f eval_normalmap(
     const ptr::object* object, int element, const vec2f& uv) {
   // YOUR CODE GOES HERE ------------------------------------------
-  return eval_normal(object, element, uv);
+  // return eval_normal(object, element, uv);
 
   auto [tu, tv] = eval_element_tangents(object, element);
   vec3f normal = eval_normal(object, element, uv);
@@ -296,11 +296,17 @@ static vec3f eval_normalmap(
 
   // auto displacement = eval_texturef(object->material->color_tex, uv);
 
-  auto texture = eval_texture(object->shape->subdiv_displacement_tex, uv);
+  auto texcoord = eval_texcoord(object, element, uv);
+  auto texture = eval_texture(object->material->normal_tex, texcoord, true);
   auto true_normal = 2*texture - 1;
-  return {tu.x * true_normal.x + tu.y * true_normal.y + tu.z * true_normal.z,
-          tv.x * true_normal.x + tv.y * true_normal.y + tv.z * true_normal.z,
-          normal.x * true_normal.x + normal.y * true_normal.y + normal.z * true_normal.z};
+
+  auto x = orthonormalize(tu, normal);
+  auto y = cross(normal, x);
+  auto z = normal;
+  auto basis = identity3x3f;
+  basis = {x, y, z};
+
+  return basis * true_normal;
 }
 
 // Eval shading normal
