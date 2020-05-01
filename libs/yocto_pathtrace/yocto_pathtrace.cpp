@@ -290,11 +290,7 @@ static vec3f eval_normalmap(
 
   auto [tu, tv] = eval_element_tangents(object, element);
   vec3f normal = eval_normal(object, element, uv);
-  auto tangent_frame = {tu, tv, normal};
-
-  // return normal;
-
-  // auto displacement = eval_texturef(object->material->color_tex, uv);
+  // auto tangent_frame = {tu, tv, normal,p};
 
   auto texcoord = eval_texcoord(object, element, uv);
   auto texture = eval_texture(object->material->normal_tex, texcoord, true);
@@ -1270,7 +1266,7 @@ static vec4f trace_path(const ptr::scene* scene, const ray3f& ray_,
       
       // accumulate emission
       emission =  vol.density * (1 - vol.scatter) * emission;
-      radiance += weight * emission; // emission
+      // radiance += weight * emission; // emission
 
       // next direction
       auto incoming = rand1f(rng) < 0.5 ? // incoming
